@@ -1,0 +1,168 @@
+name: 🎲 Ludo Master Pro — Build APK
+
+on:
+  push:
+    branches: [main, master]
+    tags:     ['v*.*.*']
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+
+  # ══════════════════════════════════════════════════════════
+  #  Build & Sign APK — signature éphémère (sans keystore)
+  # ══════════════════════════════════════════════════════════
+  build:
+    name: 🔨 Build & Sign APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - name: ☕ Java 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: temurin
+          cache: gradle
+
+      - name: 🗄️ Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('android/**/*.gradle*', 'android/**/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: 📋 Métadonnées de version
+        id: meta
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VER="${GITHUB_REF#refs/tags/v}"
+          else
+            VER="0.0.0-dev.${{ github.run_number }}"
+          fi
+          echo "VERSION_NAME=$VER"                     >> "$GITHUB_ENV"
+          echo "VERSION_CODE=${{ github.run_number }}" >> "$GITHUB_ENV"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          APK="LudoMasterPro-v${VER}-build${{ github.run_number }}.apk"
+          echo "APK_NAME=$APK" >> "$GITHUB_ENV"
+          echo "apk_name=$APK" >> "$GITHUB_OUTPUT"
+
+      - name: 🔧 Rendre gradlew exécutable
+        run: chmod +x android/gradlew
+
+      - name: 🔨 Build APK (release non signé)
+        working-directory: android
+        run: |
+          ./gradlew assembleRelease \
+            --no-daemon --stacktrace \
+            -Dorg.gradle.jvmargs="-Xmx4g -XX:MaxMetaspaceSize=512m"
+        env:
+          VERSION_CODE: ${{ env.VERSION_CODE }}
+          VERSION_NAME: ${{ env.VERSION_NAME }}
+
+      - name: 🔐 Signature éphémère (RSA 2048, jamais stockée)
+        id: sign
+        run: |
+          # 1. Clé RSA éphémère ───────────────────────────────
+          openssl genrsa -out eph.pem 2048
+
+          # 2. Certificat auto-signé (10 000 jours) ───────────
+          openssl req -new -x509 \
+            -key  eph.pem \
+            -out  eph.crt \
+            -days 10000 \
+            -subj "/CN=LudoMasterPro/O=CIBuild/C=CD"
+
+          # 3. PKCS#12 ──────────────────────────────────────────
+          openssl pkcs12 -export \
+            -inkey eph.pem -in eph.crt \
+            -out   eph.p12 \
+            -name  ludo \
+            -passout pass:ludo_eph_2024
+
+          # 4. Localiser l'APK généré ──────────────────────────
+          APK_SRC=$(find android/app/build/outputs/apk/release -name "*.apk" | head -1)
+          echo "APK source : $APK_SRC"
+          if [ -z "$APK_SRC" ]; then
+            echo "❌ Aucun APK trouvé !"
+            find android/app/build/outputs -type f
+            exit 1
+          fi
+
+          # 5. zipalign ─────────────────────────────────────────
+          ZIPALIGN=$(find "$ANDROID_SDK_ROOT/build-tools" -name "zipalign" | sort -V | tail -1)
+          "$ZIPALIGN" -v 4 "$APK_SRC" aligned.apk
+
+          # 6. apksigner ────────────────────────────────────────
+          APKSIGNER=$(find "$ANDROID_SDK_ROOT/build-tools" -name "apksigner" | sort -V | tail -1)
+          "$APKSIGNER" sign \
+            --ks           eph.p12 \
+            --ks-type      PKCS12 \
+            --ks-pass      pass:ludo_eph_2024 \
+            --key-pass     pass:ludo_eph_2024 \
+            --ks-key-alias ludo \
+            --out          "${{ env.APK_NAME }}" \
+            aligned.apk
+
+          # 7. Vérification ─────────────────────────────────────
+          "$APKSIGNER" verify --verbose "${{ env.APK_NAME }}"
+
+          # 8. Nettoyage de la clé (sécurité) ───────────────────
+          rm -f eph.pem eph.crt eph.p12
+
+          # 9. Métadonnées ───────────────────────────────────────
+          SIZE=$(du -sh "${{ env.APK_NAME }}" | cut -f1)
+          echo "apk_size=$SIZE" >> "$GITHUB_OUTPUT"
+          echo "✅ APK signé : ${{ env.APK_NAME }} ($SIZE)"
+
+      - name: 📤 Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APK_NAME }}
+          path: ${{ env.APK_NAME }}
+          retention-days: 30
+
+      - name: 🚀 Release GitHub (sur tag v*.*.*)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "🎲 Ludo Master Pro ${{ github.ref_name }}"
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-beta') }}
+          body: |
+            ## 🎲 Ludo Master Pro ${{ github.ref_name }}
+
+            ### 📲 Installation
+            1. Téléchargez l'APK ci-dessous
+            2. **Paramètres → Sécurité → Sources inconnues** → Activer
+            3. Ouvrez le fichier `.apk` et installez
+
+            | | |
+            |-|-|
+            | Version | ${{ steps.meta.outputs.version }} |
+            | Build   | #${{ github.run_number }} |
+            | Taille  | ${{ steps.sign.outputs.apk_size }} |
+            | Commit  | `${{ github.sha }}` |
+            | Signature | RSA 2048 éphémère (générée en CI) |
+          files: ${{ env.APK_NAME }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 📊 Résumé du build
+        if: always()
+        run: |
+          {
+            echo "## 🎲 Ludo Master Pro — Build #${{ github.run_number }}"
+            echo "| | |"
+            echo "|-|-|"
+            echo "| ✅ APK | \`${{ env.APK_NAME }}\` |"
+            echo "| 📦 Taille | ${{ steps.sign.outputs.apk_size }} |"
+            echo "| 🔖 Version | ${{ steps.meta.outputs.version }} |"
+            echo "| 🌿 Branche | \`${{ github.ref_name }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
